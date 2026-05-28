@@ -1,64 +1,28 @@
 {%- comment -%}
   Injected into <head> by just-the-docs.
 
-  Goal: kill the per-navigation flicker of a classic multi-page site. Two parts:
+  Anti-flicker via PRELOAD (no animation): instead of cross-fading between
+  pages, prerender the likely next pages so a click is an INSTANT swap of
+  already-built content — no white-flash, no fade to find nauseating.
 
-  1. View Transitions (CSS) — cross-fade between same-origin pages instead of a
-     hard white-flash reload. Crucially we SCOPE it: the sidebar and header are
-     identical between pages, so fading them is just visual noise. Naming them
-     lifts them out of the transition and `animation: none` holds them static —
-     only the content area cross-fades.
+  Speculation Rules prerender renders the target page in the background;
+  activation on click is near-instant. eagerness:eager prerenders all matching
+  same-origin links as soon as the rules parse — fine here, the site is tiny.
+  (Dial back to "moderate" = prerender on hover, or "conservative" =
+  on pointerdown, if eager prerendering ever feels wasteful.)
 
-  2. Speculation Rules (prerender) — the browser prerenders likely next pages on
-     hover, so activating them is near-instant. This removes the click→paint
-     latency that a cross-fade alone can't hide.
+  Browser support: Chromium (Chrome/Edge) only. Safari and Firefox ignore the
+  rules and fall back to normal navigation — no regression, just no speed-up.
+  For cross-browser coverage you'd add instant.page or <link rel="prefetch">.
 
-  Both are progressive enhancement: browsers without support (Firefox as of
-  2026 for both; Safari supports view transitions 18.2+) just fall back to
-  normal navigation. just-the-docs' own JS is untouched because navigation
-  stays full-page.
-
-  Refs:
-    https://developer.mozilla.org/en-US/docs/Web/API/View_Transition_API
-    https://developer.mozilla.org/en-US/docs/Web/API/Speculation_Rules_API
+  Ref: https://developer.mozilla.org/en-US/docs/Web/API/Speculation_Rules_API
 {%- endcomment -%}
-<style>
-  @view-transition {
-    navigation: auto;
-  }
-
-  /* Sidebar + header are persistent chrome — don't animate them, only the
-     content. Selectors match just-the-docs' DOM (.side-bar, .main-header). */
-  .side-bar    { view-transition-name: jtd-sidebar; }
-  .main-header { view-transition-name: jtd-header; }
-
-  ::view-transition-group(jtd-sidebar),
-  ::view-transition-group(jtd-header) {
-    animation: none;
-  }
-
-  /* Keep the content cross-fade short and unobtrusive. */
-  ::view-transition-old(root),
-  ::view-transition-new(root) {
-    animation-duration: 120ms;
-  }
-
-  /* Reduced motion: no cross-fade at all — instant cut. */
-  @media (prefers-reduced-motion: reduce) {
-    ::view-transition-group(*),
-    ::view-transition-old(*),
-    ::view-transition-new(*) {
-      animation: none !important;
-    }
-  }
-</style>
-
 <script type="speculationrules">
 {
   "prerender": [
     {
       "where": { "href_matches": "/questioner/*" },
-      "eagerness": "moderate"
+      "eagerness": "eager"
     }
   ]
 }
