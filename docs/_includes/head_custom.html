@@ -1,0 +1,29 @@
+{%- comment -%}
+  Injected into <head> by just-the-docs (it includes head_custom.html if present).
+
+  Smooth cross-document navigation via the View Transitions API. A classic
+  multi-page site reloads the whole document on each nav click, which the
+  browser paints as a white flash. `@view-transition { navigation: auto; }`
+  asks the browser to cross-fade between same-origin pages instead.
+
+  Pure CSS, progressive enhancement: browsers without cross-document view
+  transitions (e.g. Firefox as of 2026) simply fall back to normal navigation —
+  no flicker fix, but nothing breaks. Because navigation stays full-page, all of
+  just-the-docs' own JS (search, collapsible nav) keeps working untouched.
+
+  Ref: https://developer.mozilla.org/en-US/docs/Web/API/View_Transition_API
+{%- endcomment -%}
+<style>
+  @view-transition {
+    navigation: auto;
+  }
+
+  /* Honour users who ask for reduced motion: skip the cross-fade animation. */
+  @media (prefers-reduced-motion: reduce) {
+    ::view-transition-group(*),
+    ::view-transition-old(*),
+    ::view-transition-new(*) {
+      animation: none !important;
+    }
+  }
+</style>
