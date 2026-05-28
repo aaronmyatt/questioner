@@ -1,0 +1,6 @@
+# Local Jekyll build artifacts — never committed; GitHub Pages builds fresh.
+_site/
+.jekyll-cache/
+.jekyll-metadata
+Gemfile.lock
+vendor/

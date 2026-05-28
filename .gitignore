@@ -1,0 +1,5 @@
+# macOS
+.DS_Store
+
+# Backlog.md transient lock files (not project state)
+backlog/.locks/

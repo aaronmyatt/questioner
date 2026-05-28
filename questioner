@@ -1,0 +1,787 @@
+#!/usr/bin/env bash
+#
+# questioner — surface exploration questions for a git repository.
+#
+# Bundles the repo into a single LLM-friendly blob via `repomix`
+# (https://github.com/yamadashy/repomix) and prompts a user-chosen LLM CLI
+# for ~25 candidate questions, then asks for the strongest 5.
+#
+# The script is intentionally agnostic of downstream consumers: it emits
+# questions, not file:line bookmarks, intent tags, or flow scaffolds.
+# See ./DESIGN.md for the full rationale.
+#
+# Examples:
+#   # Default — bundle current dir, ask claude -p, print top 5.
+#   questioner
+#
+#   # Use a different LLM CLI.
+#   QUESTIONER_AGENT="llm -m gpt-4o" questioner ~/code/my-repo
+#
+#   # Just emit the bundled context (for an in-IDE agent already in convo).
+#   questioner --context-only > /tmp/repo.xml
+#
+#   # Just emit the full prompt; route it yourself.
+#   questioner --prompt | pbcopy
+
+# ── Strict mode ────────────────────────────────────────────────────────────
+# -e: abort on error; -u: error on unset vars; -o pipefail: surface failures
+# in piped commands rather than only the last process's exit code.
+set -euo pipefail
+
+# ── Version ────────────────────────────────────────────────────────────────
+# Tracks the release (keep in sync with CHANGELOG.md and the git tag).
+# Note: the baseline workflow keys on the prompt-body SHA, NOT this constant —
+# so VERSION reflects the release, while prompt changes are tracked separately.
+VERSION="0.1.0"
+
+# ── Defaults ───────────────────────────────────────────────────────────────
+# QUESTIONER_AGENT lets a user persist their preferred CLI without flags.
+# Default falls back to `claude -p` because that's the most common in-house
+# setup; any CLI that reads a prompt on stdin works.
+AGENT="${QUESTIONER_AGENT:-claude -p}"
+PASSES=1
+VERIFY=0
+COUNT=5
+CANDIDATES=25
+EXCLUDE=()
+# MODE values:
+#   invoke           — bundle, prompt, pipe to agent (default)
+#   context-only     — print bundled repo to stdout
+#   prompt           — print full prompt+context to stdout
+#   baseline         — invoke, then prompt for pairwise verdict vs current champion
+#   baseline-list    — list this repo's recorded runs (champion marked)
+#   baseline-show    — print this repo's champion output + verdict history
+#   baseline-rate    — retroactively rate this repo's latest 'skip' run
+# All baseline modes operate on the repo at [path] (default "."); their
+# storage lives inside that repo (see BASELINES_DIR below).
+MODE="invoke"
+REPO_PATH="."
+
+# ── Baseline-workflow defaults ─────────────────────────────────────────────
+# Baselines are stored INSIDE the repo being evaluated, so they version with
+# the codebase they describe (the maintainer/prompt-eval workflow — see
+# DESIGN.md §4.4). Default location is <repo>/.questioner; the actual repo
+# path isn't known until after argparse, so we resolve this lazily below.
+# Precedence: --baselines-dir flag > $QUESTIONER_BASELINES_DIR env > repo-local.
+BASELINES_DIR=""
+
+# Non-interactive overrides for the rating prompt. When empty, the script
+# reads from /dev/tty; when set, it skips the prompt entirely. Useful for
+# scripted re-runs or CI.
+VERDICT=""    # one of: b | w | s | skip (or full words: better/worse/same/skip)
+NOTES=""
+
+usage() {
+  # Print the version from the single VERSION constant, then the static help
+  # body. Keeping the body a quoted heredoc avoids any accidental expansion.
+  echo "questioner $VERSION"
+  echo
+  cat <<'EOF'
+usage: questioner [options] [path]
+
+Surface exploration questions for a repository by bundling its source via
+repomix and prompting an LLM CLI to propose candidates, then ranking down
+to a top-N set.
+
+modes (mutually exclusive):
+  (default)            bundle → invoke agent via stdin → print response
+  --context-only       print bundled repo context to stdout
+  --prompt             print the full prompt + context to stdout
+
+options:
+  --agent CMD          agent CLI invocation (must read prompt on stdin)
+                       default: $QUESTIONER_AGENT or "claude -p"
+  --passes N           run generation N times (default 1; >1 planned, see
+                       DESIGN.md §7.1, not yet implemented)
+  --verify             presupposition-check pass on top candidates
+                       (planned, see DESIGN.md §7.1, not yet implemented)
+  --count N            final questions to present (default 5)
+  --candidates N       raw candidates to generate (default 25)
+  --exclude PATTERN    passed to repomix --ignore (repeatable)
+  --version            print version and exit
+  -h, --help           show this help
+
+prompt development (maintainer tools — not part of normal end-user use):
+  These evaluate and iterate on questioner's OWN prompt. They compare whole
+  question-sets across prompt versions; since end users don't edit the
+  prompt, there's little here for them. Storage lives inside the repo being
+  evaluated (<repo>/.questioner), so baselines version with the codebase.
+  See DESIGN.md §4.4. All take an optional [path] (default ".").
+
+  --baseline [path]    invoke, then rate the run better/worse/same against
+                       the current champion for this repo
+  --baseline-list [path]  list this repo's recorded runs (champion marked)
+  --baseline-show [path]  print this repo's champion output + verdict history
+  --baseline-rate [path]  retroactively rate this repo's latest 'skip' run
+                       (use with --verdict)
+  --baselines-dir DIR  override storage location (default: <repo>/.questioner)
+  --verdict V          non-interactive verdict (b/w/s/skip or full words)
+  --notes "TEXT"       optional one-line note attached to the rating
+
+env:
+  QUESTIONER_AGENT       default agent CLI invocation
+  QUESTIONER_BASELINES_DIR  override baselines storage location (see above)
+EOF
+}
+
+# ── Arg parsing ────────────────────────────────────────────────────────────
+# Plain getopts can't handle long flags portably across macOS/Linux bash, so
+# we hand-roll a small loop. Order of cases matters only for readability.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent)          AGENT="$2"; shift 2 ;;
+    --passes)         PASSES="$2"; shift 2 ;;
+    --verify)         VERIFY=1; shift ;;
+    --count)          COUNT="$2"; shift 2 ;;
+    --candidates)     CANDIDATES="$2"; shift 2 ;;
+    --exclude)        EXCLUDE+=("$2"); shift 2 ;;
+    --context-only)   MODE="context-only"; shift ;;
+    --prompt)         MODE="prompt"; shift ;;
+    # Baseline workflow — see DESIGN.md §4.4 and TASK-3. Every baseline mode
+    # keys off REPO_PATH (the positional [path]); none take a slug anymore,
+    # since each repo has its own local store.
+    --baseline)       MODE="baseline"; shift ;;
+    --baseline-list)  MODE="baseline-list"; shift ;;
+    --baseline-show)  MODE="baseline-show"; shift ;;
+    --baseline-rate)  MODE="baseline-rate"; shift ;;
+    --baselines-dir)  BASELINES_DIR="$2"; shift 2 ;;
+    --verdict)        VERDICT="$2"; shift 2 ;;
+    --notes)          NOTES="$2"; shift 2 ;;
+    -h|--help)        usage; exit 0 ;;
+    --version)        echo "questioner $VERSION"; exit 0 ;;
+    -*)               echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)                REPO_PATH="$1"; shift ;;
+  esac
+done
+
+# ── Resolve the baselines directory ────────────────────────────────────────
+# Precedence: --baselines-dir flag (already set above) > env var > repo-local
+# default of <repo>/.questioner. Resolving here (not in the defaults block)
+# because the repo-local default depends on REPO_PATH, parsed just above.
+if [[ -z "$BASELINES_DIR" ]]; then
+  if [[ -n "${QUESTIONER_BASELINES_DIR:-}" ]]; then
+    BASELINES_DIR="$QUESTIONER_BASELINES_DIR"
+  else
+    if [[ ! -d "$REPO_PATH" ]]; then
+      echo "questioner: path '$REPO_PATH' is not a directory" >&2
+      exit 2
+    fi
+    BASELINES_DIR="$(cd "$REPO_PATH" && pwd)/.questioner"
+  fi
+fi
+
+# ── Tool checks ────────────────────────────────────────────────────────────
+# Modes that bundle the repo need repomix. Modes that read/write the JSON
+# baselines store need jq. Both checks happen up-front so we fail before
+# starting any work, with a clear install hint.
+#
+# repomix: https://github.com/yamadashy/repomix
+# jq: https://jqlang.github.io/jq/  (https://github.com/jqlang/jq)
+#
+# We deliberately do not auto-install — silent installs are a security and
+# footprint surprise. Point the user at the cheapest install path instead.
+
+needs_repomix() {
+  case "$MODE" in
+    baseline-list|baseline-show|baseline-rate) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+needs_jq() {
+  case "$MODE" in
+    baseline|baseline-list|baseline-show|baseline-rate) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if needs_repomix && ! command -v repomix >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+questioner: repomix not found on PATH.
+
+Install one of these ways:
+  npm install -g repomix              # global install
+  bunx repomix --version              # no install; bun runs it on demand
+  npx repomix --version               # no install; npm runs it on demand
+  brew install repomix                # if Homebrew has it on your platform
+
+Docs: https://github.com/yamadashy/repomix
+EOF
+  exit 127
+fi
+
+if needs_jq && ! command -v jq >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+questioner: jq not found on PATH (required for baseline subcommands).
+
+Install one of these ways:
+  brew install jq                     # macOS
+  apt-get install jq                  # Debian/Ubuntu
+  dnf install jq                      # Fedora
+
+Docs: https://jqlang.github.io/jq/
+EOF
+  exit 127
+fi
+
+# ── Baseline helper functions ──────────────────────────────────────────────
+# Grouped here so all baseline-workflow logic is in one place. The functions
+# are pure-ish: they take inputs as args (or read globals like BASELINES_DIR),
+# and write to JSON files atomically (tempfile + mv) so a Ctrl-C mid-write
+# can't leave corrupted state.
+
+# Cross-platform SHA-256 → first 12 hex chars. macOS ships `shasum`; most
+# Linux distros ship `sha256sum`; we accept either. 12 chars (48 bits) is
+# more than enough to identify a prompt version uniquely within this project.
+sha256_first12() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print substr($1,1,12)}'
+  else
+    shasum -a 256 | awk '{print substr($1,1,12)}'
+  fi
+}
+
+# Extract the heredoc body (the prompt prose) from this script and hash it.
+# Hashing the *body only* — not the surrounding cat/sed/argparse — means
+# unrelated edits (a typo fix in --help, a new flag) don't bump the prompt
+# version. The version moves iff the prompt itself moves.
+# awk pattern: print lines strictly between the heredoc-open and heredoc-close
+# markers. See DESIGN.md §4.3 for what counts as the prompt body.
+prompt_body_sha() {
+  awk "/<<'PROMPT'/{flag=1; next} /^PROMPT\$/{flag=0} flag" "${BASH_SOURCE[0]}" \
+    | sha256_first12
+}
+
+# Repo slug = basename of an absolute path. Used only as a human-readable
+# label in output and inside the JSON; no longer part of any file path,
+# since each repo now has its own store.
+repo_slug_for() {
+  basename "$(cd "$1" && pwd)"
+}
+
+# Ensure the baselines dir + runs subdir exist. Idempotent. The runs/
+# subdir holds the raw question-text output of every recorded run, named
+# by prompt-sha + timestamp (the containing repo identifies the rest).
+ensure_baselines_dirs() {
+  mkdir -p "$BASELINES_DIR/runs"
+}
+
+# Path to this repo's single baseline JSON. Storage is repo-local
+# ($BASELINES_DIR is <repo>/.questioner by default), so there is exactly
+# one baseline.json per store — no slug keying.
+repo_json_path() {
+  echo "$BASELINES_DIR/baseline.json"
+}
+
+# Initialize the baseline JSON if missing. The slug + abs path are stored
+# as labels only. Schema documented in DESIGN.md §4.4 and TASK-3.
+init_repo_json_if_missing() {
+  local slug="$1" abs_path="$2" jpath
+  jpath="$(repo_json_path)"
+  [[ -f "$jpath" ]] && return 0
+  jq -n --arg repo "$slug" --arg p "$abs_path" \
+    '{repo: $repo, repo_path: $p, champion: null, runs: []}' > "$jpath"
+}
+
+# Atomic JSON update: read $jpath, transform via the supplied jq filter
+# (passed as the first arg), write to a tempfile in the same dir, mv into
+# place. Same-dir tempfile guarantees mv is atomic (rename within a single
+# filesystem). https://www.gnu.org/software/coreutils/manual/html_node/mv-invocation.html
+jq_update_inplace() {
+  local jpath="$1"; shift
+  local filter="$1"; shift
+  local tmp="${jpath}.tmp.$$"
+  jq "$@" "$filter" "$jpath" > "$tmp"
+  mv "$tmp" "$jpath"
+}
+
+# Print this repo's champion run record (one JSON line). Empty output
+# (and exit 0) means no champion yet.
+get_champion_record() {
+  local jpath
+  jpath="$(repo_json_path)"
+  [[ -f "$jpath" ]] || return 0
+  jq -c '
+    if .champion == null then empty
+    else (.runs[] | select(.id == $cid))
+    end
+  ' --arg cid "$(jq -r '.champion.run_id // ""' "$jpath")" "$jpath"
+}
+
+# Normalize whatever the user typed into a canonical verdict.
+# Accepts b/w/s/skip and the full words. Anything else returns empty string,
+# which the caller treats as "ask again" (interactive) or "fail" (scripted).
+normalize_verdict() {
+  case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+    b|better)  echo "better" ;;
+    w|worse)   echo "worse" ;;
+    s|same)    echo "same" ;;
+    skip)      echo "skipped" ;;
+    *)         echo "" ;;
+  esac
+}
+
+# Prompt for verdict + notes on /dev/tty. Sets the globals VERDICT_RESOLVED
+# and NOTES_RESOLVED. Loops until a valid verdict is entered. Fails if
+# /dev/tty is not available (e.g. non-interactive context with no --verdict).
+prompt_for_verdict_interactive() {
+  if [[ ! -r /dev/tty ]]; then
+    echo "questioner: no /dev/tty available — pass --verdict for non-interactive use" >&2
+    exit 2
+  fi
+  local raw=""
+  while :; do
+    printf '\nVerdict [b=better / w=worse / s=same / skip]: ' > /dev/tty
+    IFS= read -r raw < /dev/tty || raw="skip"
+    VERDICT_RESOLVED="$(normalize_verdict "$raw")"
+    [[ -n "$VERDICT_RESOLVED" ]] && break
+    printf "  unrecognised — try one of: b, w, s, skip\n" > /dev/tty
+  done
+  if [[ -z "$NOTES" ]]; then
+    printf 'Notes (optional, single line, Enter to skip): ' > /dev/tty
+    IFS= read -r NOTES_RESOLVED < /dev/tty || NOTES_RESOLVED=""
+  else
+    NOTES_RESOLVED="$NOTES"
+  fi
+}
+
+# Append a run record to this repo's JSON and (if 'better' or inaugural)
+# update the champion pointer. All in one transformation so a Ctrl-C
+# between writes can't leave the champion pointing at an unrecorded run.
+record_run() {
+  local prompt_sha="$1" run_id="$2" output_rel="$3"
+  local verdict="$4" compared="$5" notes="$6" timestamp="$7"
+  local jpath; jpath="$(repo_json_path)"
+
+  # Build the run object once, append to .runs, then conditionally update
+  # .champion if the verdict was 'better' or this is the inaugural run.
+  local promote_filter=''
+  if [[ "$verdict" == "better" || "$verdict" == "inaugural" ]]; then
+    promote_filter=' | .champion = {run_id: $rid, promoted_at: $ts}'
+  fi
+
+  jq_update_inplace "$jpath" "
+    .runs += [{
+      id: \$rid,
+      timestamp: \$ts,
+      prompt_sha: \$psha,
+      agent: \$agent,
+      candidates: (\$cand | tonumber),
+      count: (\$cnt | tonumber),
+      verdict: \$verdict,
+      compared_against: (if \$cmp == \"\" then null else \$cmp end),
+      notes: \$notes,
+      output_file: \$out
+    }]${promote_filter}
+  " \
+    --arg rid "$run_id" \
+    --arg ts "$timestamp" \
+    --arg psha "$prompt_sha" \
+    --arg agent "$AGENT" \
+    --arg cand "$CANDIDATES" \
+    --arg cnt "$COUNT" \
+    --arg verdict "$verdict" \
+    --arg cmp "$compared" \
+    --arg notes "$notes" \
+    --arg out "$output_rel"
+}
+
+# ── Build the bundled repo context ─────────────────────────────────────────
+# repomix's stdout flag has varied across versions; writing to a temp file
+# is the portable approach. The trap ensures cleanup on any exit path.
+# Only modes that need the bundle pay this cost; baseline-list/show/rate
+# read JSON only and skip bundling entirely.
+if needs_repomix; then
+  BUNDLE_FILE="$(mktemp -t questioner.XXXXXX)"
+  trap 'rm -f "$BUNDLE_FILE"' EXIT
+
+  repomix_args=( "$REPO_PATH" --style xml --output "$BUNDLE_FILE" )
+  for pat in "${EXCLUDE[@]}"; do
+    repomix_args+=( --ignore "$pat" )
+  done
+
+  # Suppress repomix's progress chatter on stdout; preserve real errors on
+  # stderr. The bundled XML goes to the temp file, not stdout, so this is safe.
+  repomix "${repomix_args[@]}" >/dev/null
+fi
+
+# ── Prompt construction ────────────────────────────────────────────────────
+# The prompt steers the LLM toward a *landscape* of questions, not a stack
+# of deep-cut walkthroughs. Three tiers (see DESIGN.md §4.3 for rationale):
+#
+#   Tier A — Purpose & surface         (~1/5 of candidates)
+#   Tier B — Architecture & seams      (~2/5 of candidates)
+#   Tier C — Deep cuts & non-obvious   (~2/5 of candidates)
+#
+# The TOP-N selection rule (≥1 A, ≥1 B, ≤2 C) forces the headline output
+# to span tiers even when individual deep cuts score highest. Without that
+# rule the set drifts toward specialist-to-specialist questions and stops
+# being useful for newcomers — see the project memory on this.
+#
+# The heredoc delimiter is quoted (<<'PROMPT') so bash performs ZERO
+# expansion inside the body. This matters because the prompt is full of
+# backticked symbols (`/tmp/sp`, `EventStore.events`, …) that an unquoted
+# heredoc would treat as command substitutions and try to execute. The
+# trade-off: ${CANDIDATES} and ${COUNT} can't expand either, so we use
+# {{CANDIDATES}} / {{COUNT}} placeholders and post-process with sed.
+# Refs:
+#   bash heredocs and quoting:
+#     https://www.gnu.org/software/bash/manual/html_node/Redirections.html#Here-Documents
+#   why quoted heredocs are safer for template prose:
+#     https://mywiki.wooledge.org/BashFAQ/082
+build_prompt() {
+  # Quoted delimiter ('PROMPT') → no $var, no $(...), no `cmd` substitution.
+  # Then sed swaps the two placeholders for their integer values. Integers
+  # are safe inside sed s/// without escaping; if a future placeholder ever
+  # held a value with /, &, or \ we'd need to escape it.
+  cat <<'PROMPT' | sed -e "s/{{CANDIDATES}}/${CANDIDATES}/g" \
+                       -e "s/{{COUNT}}/${COUNT}/g"
+You are surfacing {{CANDIDATES}} exploration questions a curious reader
+should be able to browse to build a usable mental map of the bundled
+project — from what it does, to how it's shaped, to what's interesting
+in its corners. Breadth across the project beats depth on any one question.
+
+The {{CANDIDATES}} questions must span THREE tiers. The proportions are
+targets, not quotas, but every tier must be well-represented:
+
+  Tier A — Purpose & surface  (about 1/5 of the set)
+    What does this project do, and for whom? What is the smallest end-to-end
+    example of using it? What is the user-visible entry point?
+    A Tier A question:
+      • names a specific surface-level file, command, or symbol
+      • is answerable in 2–3 minutes by reading ONE file
+      • does NOT require multi-file synthesis
+    Each Tier A question opens the project to a complete newcomer.
+
+  Tier B — Architecture & seams  (about 2/5 of the set)
+    The major modules and how they communicate. Trust, process, network,
+    and file boundaries. Pluggable extension points. Data flow at the
+    sketch level.
+    A Tier B question:
+      • spans 2–4 files
+      • reveals a structural decision visible directly in the code
+      • a reader can chew on the answer in 5–10 minutes
+    Each Tier B question hands the reader a usable mental model.
+
+  Tier C — Deep cuts & non-obvious decisions  (about 2/5 of the set)
+    Cross-cutting concerns: lifecycle, ordering, TTL, idempotency, runtime
+    quirks. Decisions that look arbitrary until explained. Workarounds for
+    library/runtime gotchas. High-churn areas.
+    A Tier C question:
+      • synthesizes across 3+ files OR encodes a non-obvious cross-cutting
+        concern (lifecycle, ordering invariant, runtime quirk, etc.)
+      • would be worth a guided walkthrough rather than just reading the
+        file — generic questions ("how does X work?") cannot pass this bar
+      • a reader needs 15–30 minutes to really sit with
+
+Every question — regardless of tier — must name specific files, symbols,
+or commands visible in the bundled context. Generic phrasing fails on
+all tiers. If a question fits no tier cleanly, label it [C].
+
+Examples — one WRONG and one RIGHT per tier:
+
+  Tier A
+    WRONG: "What is the project's mission?"
+           — vague, no file to verify against.
+    RIGHT: "What does running the entry-point CLI against an empty
+           directory produce, and which file holds the usage/help text?"
+           — concrete, single file answers it, opens the project.
+
+  Tier B
+    WRONG: "How does the architecture work?"
+           — too broad; doesn't name any seam.
+    RIGHT: "Walk through how a single dump from /tmp/sp becomes a row
+           in EventStore and triggers WindowController.show() — what
+           runs on which actor/queue, and where does the MainActor hop
+           happen?"
+           — names a flow, spans 3–4 files, reveals threading model
+           without requiring project-history knowledge.
+
+  Tier C
+    WRONG: "What does fooBar() do?"
+           — answered by reading the function itself.
+    RIGHT: "Why does FileWatchReceiver poll /tmp/sp on a 200ms Timer
+           instead of using DispatchSourceFileSystemObject, and how
+           does the two-layer change detection interact with the
+           startup O_TRUNC?"
+           — non-obvious decision spanning the watcher, the writer,
+           and the file lifecycle; rewards a walkthrough.
+
+Output format — produce exactly {{CANDIDATES}} numbered questions, one
+per line, tier label first in square brackets:
+
+  1. [A] question text
+  2. [B] question text
+  3. [C] question text
+  ...
+
+After the numbered list, on a new line, produce:
+
+  TOP {{COUNT}}: <comma-separated question numbers>
+
+TOP-{{COUNT}} selection rule (STRICT — violating this is a failure):
+  • At least one Tier A question.
+  • At least one Tier B question.
+  • At most two Tier C questions.
+  • Pick for breadth of the mental map first, depth of insight second.
+  • Follow with 1–2 sentences total justifying the {{COUNT}} picks
+    as a set, not individually.
+
+Repository follows:
+
+PROMPT
+  cat "$BUNDLE_FILE"
+}
+
+# ── Dispatch by mode ───────────────────────────────────────────────────────
+case "$MODE" in
+  context-only)
+    # Just the repo bundle. An agent already in conversation can do its own
+    # prompting around this content.
+    cat "$BUNDLE_FILE"
+    ;;
+  prompt)
+    # Full prompt + context. Useful for piping into any LLM CLI by hand,
+    # or for putting into a clipboard for a web UI.
+    build_prompt
+    ;;
+  invoke)
+    # v0: single-pass invocation. Multi-pass triangulation and presupposition
+    # verification are designed in DESIGN.md §7.1 but not implemented yet.
+    # Failing loudly is better than silently ignoring the requested flags.
+    if [[ "$PASSES" -gt 1 || "$VERIFY" -eq 1 ]]; then
+      cat >&2 <<'EOF'
+questioner: --passes >1 and --verify are designed but not implemented in v0.
+See DESIGN.md §7.1. Use --prompt and pipe manually if you want to experiment.
+EOF
+      exit 64
+    fi
+
+    # Split AGENT on whitespace into an array. Safer than `eval` for
+    # executing a user-supplied command line — no shell metacharacter
+    # surprises from values in $QUESTIONER_AGENT.
+    IFS=' ' read -r -a AGENT_ARR <<< "$AGENT"
+    build_prompt | "${AGENT_ARR[@]}"
+    ;;
+  baseline)
+    # Pairwise baseline workflow. Runs the agent normally, tees the output
+    # to a permanent file under $BASELINES_DIR/runs/, then prompts the user
+    # to rate the run better/worse/same against the current champion for
+    # this repo. 'better' promotes; 'worse' and 'same' record only.
+    # See TASK-3 and DESIGN.md §4.4 for the full design rationale.
+    if [[ "$PASSES" -gt 1 || "$VERIFY" -eq 1 ]]; then
+      echo "questioner: --passes >1 and --verify not supported by --baseline yet" >&2
+      exit 64
+    fi
+
+    ensure_baselines_dirs
+    REPO_ABS="$(cd "$REPO_PATH" && pwd)"
+    REPO_SLUG="$(repo_slug_for "$REPO_PATH")"
+    init_repo_json_if_missing "$REPO_SLUG" "$REPO_ABS"
+
+    PROMPT_SHA="$(prompt_body_sha)"
+    # date -u +"%Y%m%dT%H%M%SZ" works the same on macOS and GNU coreutils.
+    # https://man7.org/linux/man-pages/man1/date.1.html
+    RUN_TS_FS="$(date -u +"%Y%m%dT%H%M%SZ")"
+    RUN_TS_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    # Run id is prompt-sha + timestamp; the repo-local store identifies the
+    # repo, so no slug prefix is needed.
+    RUN_ID="${PROMPT_SHA}-${RUN_TS_FS}"
+    RUN_OUTPUT_REL="runs/${RUN_ID}.txt"
+    RUN_OUTPUT_ABS="${BASELINES_DIR}/${RUN_OUTPUT_REL}"
+
+    # Capture the current champion (may be empty for the inaugural run)
+    # BEFORE the new run is recorded, so the comparison framing is correct.
+    CHAMPION_JSON="$(get_champion_record)"
+
+    # Pre-run banner so the user knows what they're about to rate against.
+    {
+      echo ""
+      echo "──── questioner --baseline ────"
+      echo "  repo:        $REPO_SLUG ($REPO_ABS)"
+      echo "  prompt sha:  $PROMPT_SHA"
+      if [[ -n "$CHAMPION_JSON" ]]; then
+        ch_sha="$(echo "$CHAMPION_JSON" | jq -r '.prompt_sha')"
+        ch_ts="$(echo "$CHAMPION_JSON" | jq -r '.timestamp')"
+        ch_out="$(echo "$CHAMPION_JSON" | jq -r '.output_file')"
+        echo "  champion:    $ch_sha  (captured $ch_ts)"
+        echo "  champion out: $BASELINES_DIR/$ch_out"
+      else
+        echo "  champion:    (none yet — this run will be inaugural)"
+      fi
+      echo "──────────────────────────────"
+      echo ""
+    } >&2
+
+    # Run the agent and tee its output to both stdout (for the user to read
+    # live) and the permanent runs/ file (for later side-by-side comparison).
+    IFS=' ' read -r -a AGENT_ARR <<< "$AGENT"
+    build_prompt | "${AGENT_ARR[@]}" | tee "$RUN_OUTPUT_ABS"
+
+    # Resolve the verdict: --verdict wins, else /dev/tty prompt.
+    # Interactivity rule: we only attempt /dev/tty I/O when --verdict is
+    # absent. A user who passed --verdict has signalled non-interactive
+    # intent — even on an inaugural run (where verdict is fixed) we should
+    # not block on a notes prompt. The [-r /dev/tty] stat check is also
+    # not reliable in subshells / CI; `--verdict` is the honest gate.
+    if [[ -z "$CHAMPION_JSON" ]]; then
+      # Inaugural run: no comparison possible. Verdict is fixed.
+      VERDICT_RESOLVED="inaugural"
+      if [[ -n "$NOTES" ]]; then
+        NOTES_RESOLVED="$NOTES"
+      elif [[ -z "$VERDICT" ]] && ( exec </dev/tty ) 2>/dev/null; then
+        printf '\nNotes for inaugural champion (optional, single line): ' > /dev/tty
+        IFS= read -r NOTES_RESOLVED < /dev/tty || NOTES_RESOLVED=""
+      else
+        NOTES_RESOLVED=""
+      fi
+    elif [[ -n "$VERDICT" ]]; then
+      VERDICT_RESOLVED="$(normalize_verdict "$VERDICT")"
+      if [[ -z "$VERDICT_RESOLVED" ]]; then
+        echo "questioner: invalid --verdict '$VERDICT' (use b/w/s/skip)" >&2
+        exit 2
+      fi
+      NOTES_RESOLVED="$NOTES"
+    else
+      cat <<TTYINFO > /dev/tty 2>/dev/null || true
+
+──── compare ────────────────────────────────────
+champion: $BASELINES_DIR/$(echo "$CHAMPION_JSON" | jq -r '.output_file')
+this run: $RUN_OUTPUT_ABS
+
+Open both and compare the question sets, then enter a verdict.
+TTYINFO
+      prompt_for_verdict_interactive
+    fi
+
+    COMPARED_AGAINST=""
+    if [[ -n "$CHAMPION_JSON" ]]; then
+      COMPARED_AGAINST="$(echo "$CHAMPION_JSON" | jq -r '.id')"
+    fi
+
+    record_run \
+      "$PROMPT_SHA" "$RUN_ID" "$RUN_OUTPUT_REL" \
+      "$VERDICT_RESOLVED" "$COMPARED_AGAINST" "${NOTES_RESOLVED:-}" "$RUN_TS_ISO"
+
+    # Post-run summary on stderr so it doesn't pollute piped output.
+    {
+      echo ""
+      echo "──── recorded ─────────────────────────────────"
+      echo "  run id:   $RUN_ID"
+      echo "  output:   $RUN_OUTPUT_ABS"
+      echo "  verdict:  $VERDICT_RESOLVED"
+      case "$VERDICT_RESOLVED" in
+        inaugural)
+          echo "  -> INAUGURAL CHAMPION for $REPO_SLUG (prompt sha: $PROMPT_SHA)" ;;
+        better)
+          echo "  -> NEW CHAMPION for $REPO_SLUG"
+          echo "     prev: $(echo "$CHAMPION_JSON" | jq -r '.prompt_sha')"
+          echo "     now:  $PROMPT_SHA" ;;
+        worse|same)
+          echo "  champion unchanged: $(echo "$CHAMPION_JSON" | jq -r '.prompt_sha')" ;;
+        skipped)
+          echo "  no verdict recorded — rate later from this repo with: --baseline-rate --verdict ..." ;;
+      esac
+      echo "───────────────────────────────────────────────"
+    } >&2
+    ;;
+  baseline-list)
+    # Summarize this repo's baseline store: champion + a one-line entry per
+    # recorded run, with the champion run marked. Operates on the single
+    # repo-local store (no cross-repo enumeration — storage is per-repo now).
+    jpath="$(repo_json_path)"
+    REPO_SLUG="$(repo_slug_for "$REPO_PATH")"
+    if [[ ! -f "$jpath" ]]; then
+      echo "(no baselines for $REPO_SLUG — store would be at $BASELINES_DIR)" >&2
+      exit 0
+    fi
+    ch_id="$(jq -r '.champion.run_id // ""' "$jpath")"
+    total="$(jq '.runs | length' "$jpath")"
+    echo "baseline: $REPO_SLUG"
+    echo "  store: $BASELINES_DIR"
+    if [[ -z "$ch_id" ]]; then
+      echo "  champion: (none)  runs: $total"
+    else
+      ch_sha="$(jq -r --arg id "$ch_id" '.runs[] | select(.id == $id) | .prompt_sha' "$jpath")"
+      ch_promoted="$(jq -r '.champion.promoted_at' "$jpath")"
+      echo "  champion: $ch_sha  (since $ch_promoted)  runs: $total"
+    fi
+    echo "  ── runs ──"
+    jq -r --arg cid "$ch_id" '
+      .runs[] | "    \(.timestamp)  \(.prompt_sha)  \(.verdict | ascii_upcase)\(if .id == $cid then "  (champion)" else "" end)"
+    ' "$jpath"
+    ;;
+  baseline-show)
+    # Print this repo's champion question text + chronological verdict
+    # history. Useful for "what does my current best actually look like"
+    # and "what did I try along the way".
+    jpath="$(repo_json_path)"
+    REPO_SLUG="$(repo_slug_for "$REPO_PATH")"
+    if [[ ! -f "$jpath" ]]; then
+      echo "questioner: no baselines for $REPO_SLUG (store would be at $BASELINES_DIR)" >&2
+      exit 1
+    fi
+    ch_id="$(jq -r '.champion.run_id // ""' "$jpath")"
+    if [[ -z "$ch_id" ]]; then
+      echo "(no champion yet for $REPO_SLUG; $(jq '.runs | length' "$jpath") run(s) recorded)" >&2
+    else
+      ch_out="$(jq -r --arg id "$ch_id" '.runs[] | select(.id == $id) | .output_file' "$jpath")"
+      echo "──── champion: $REPO_SLUG ────"
+      jq -r --arg id "$ch_id" '
+        .runs[] | select(.id == $id) |
+        "  prompt sha:  \(.prompt_sha)\n  recorded:    \(.timestamp)\n  agent:       \(.agent)\n  notes:       \(.notes // "(none)")"
+      ' "$jpath"
+      echo "──── output ────"
+      cat "$BASELINES_DIR/$ch_out"
+    fi
+    echo ""
+    echo "──── verdict history ────"
+    jq -r '
+      .runs[] | "  \(.timestamp)  \(.prompt_sha)  \(.verdict | ascii_upcase)\(if .notes != "" and .notes != null then "  — \(.notes)" else "" end)"
+    ' "$jpath"
+    ;;
+  baseline-rate)
+    # Retroactively rate this repo's most-recent 'skipped' run without
+    # re-invoking the LLM. Requires --verdict; --notes is optional. The
+    # comparison target is whatever champion is current at rate time (not
+    # at the time of the original run).
+    jpath="$(repo_json_path)"
+    REPO_SLUG="$(repo_slug_for "$REPO_PATH")"
+    if [[ ! -f "$jpath" ]]; then
+      echo "questioner: no baselines for $REPO_SLUG (store would be at $BASELINES_DIR)" >&2
+      exit 1
+    fi
+    if [[ -z "$VERDICT" ]]; then
+      echo "questioner: --baseline-rate requires --verdict b|w|s" >&2
+      exit 2
+    fi
+    NEW_VERDICT="$(normalize_verdict "$VERDICT")"
+    if [[ -z "$NEW_VERDICT" || "$NEW_VERDICT" == "skipped" ]]; then
+      echo "questioner: --baseline-rate verdict must be better/worse/same (not skip)" >&2
+      exit 2
+    fi
+    # Find the most-recent skipped run (largest timestamp).
+    SKIPPED_ID="$(jq -r '[.runs[] | select(.verdict == "skipped")] | sort_by(.timestamp) | last | .id // ""' "$jpath")"
+    if [[ -z "$SKIPPED_ID" ]]; then
+      echo "questioner: no skipped runs to rate for $REPO_SLUG" >&2
+      exit 1
+    fi
+    # Update the run's verdict in place; if 'better', also promote champion.
+    PROMOTE=""
+    if [[ "$NEW_VERDICT" == "better" ]]; then
+      PROMOTE=' | .champion = {run_id: $rid, promoted_at: $ts}'
+    fi
+    jq_update_inplace "$jpath" "
+      (.runs[] | select(.id == \$rid) | .verdict) = \$verdict
+      | (.runs[] | select(.id == \$rid) | .notes) |= (if \$notes == \"\" then . else \$notes end)
+      ${PROMOTE}
+    " \
+      --arg rid "$SKIPPED_ID" \
+      --arg verdict "$NEW_VERDICT" \
+      --arg notes "$NOTES" \
+      --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo "rated $SKIPPED_ID → $NEW_VERDICT" >&2
+    if [[ "$NEW_VERDICT" == "better" ]]; then
+      echo "-> NEW CHAMPION for $REPO_SLUG" >&2
+    fi
+    ;;
+esac

@@ -1,0 +1,34 @@
+# Jekyll configuration for the questioner GitHub Pages site.
+# Built by GitHub Pages from the /docs folder on the main branch.
+# Docs: https://docs.github.com/en/pages/setting-up-a-github-pages-site-with-jekyll
+#
+# NOTE: url/baseurl assume a project site at https://<owner>.github.io/<repo>.
+# Adjust 'url' and 'baseurl' if the repo is renamed or moved to an org.
+title: questioner
+description: >-
+  Surface a handful of high-signal exploration questions about any repository,
+  grounded in its actual code.
+url: https://aaronmyatt.github.io
+baseurl: /questioner
+
+# just-the-docs is a docs-oriented theme with built-in nav + search.
+# It is pulled in as a remote theme; GitHub Pages supports the
+# jekyll-remote-theme plugin. https://just-the-docs.com/
+remote_theme: just-the-docs/just-the-docs
+
+plugins:
+  - jekyll-remote-theme
+
+# just-the-docs options
+search_enabled: true
+heading_anchors: true
+aux_links:
+  "GitHub":
+    - "https://github.com/aaronmyatt/questioner"
+aux_links_new_tab: true
+
+# Don't process project meta files as site content.
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
