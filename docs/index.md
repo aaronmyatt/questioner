@@ -70,14 +70,14 @@ questioner
 
 No LLM CLI handy? `questioner --prompt | pbcopy` gives you the full prompt to paste anywhere, and `questioner --context-only` emits just the bundled repo for an agent you're already chatting with.
 
-See [Installation](install) for all the options and [Usage](usage) for the full flag reference.
+See [Installation](install.html) for all the options and [Usage](usage.html) for the full flag reference.
 
 ---
 
 ## More
 
-- [Installation](install) — dependencies, install paths, agent configuration
-- [Usage](usage) — modes, flags, and recipes
+- [Installation](install.html) — dependencies, install paths, agent configuration
+- [Usage](usage.html) — modes, flags, and recipes
 - [Design rationale](https://github.com/aaronmyatt/questioner/blob/main/DESIGN.md) — why it works the way it does
 - [Agent integration](https://github.com/aaronmyatt/questioner/blob/main/SKILL.md) — using `questioner` from Claude Code, Cursor, Zed, etc.
 - [License](https://github.com/aaronmyatt/questioner/blob/main/LICENSE) — MIT © Aaron Myatt

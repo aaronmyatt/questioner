@@ -74,4 +74,4 @@ questioner --agent "llm -m gpt-4o" ~/code/some-project
 | an LLM CLI on stdin | answers the prompt | default mode only (not `--prompt` / `--context-only`) |
 | `jq` | reads/writes the baseline store | maintainer `--baseline*` commands only |
 
-Next: [Usage](usage).
+Next: [Usage](usage.html).

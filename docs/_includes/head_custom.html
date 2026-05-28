@@ -1,24 +1,49 @@
 {%- comment -%}
-  Injected into <head> by just-the-docs (it includes head_custom.html if present).
+  Injected into <head> by just-the-docs.
 
-  Smooth cross-document navigation via the View Transitions API. A classic
-  multi-page site reloads the whole document on each nav click, which the
-  browser paints as a white flash. `@view-transition { navigation: auto; }`
-  asks the browser to cross-fade between same-origin pages instead.
+  Goal: kill the per-navigation flicker of a classic multi-page site. Two parts:
 
-  Pure CSS, progressive enhancement: browsers without cross-document view
-  transitions (e.g. Firefox as of 2026) simply fall back to normal navigation —
-  no flicker fix, but nothing breaks. Because navigation stays full-page, all of
-  just-the-docs' own JS (search, collapsible nav) keeps working untouched.
+  1. View Transitions (CSS) — cross-fade between same-origin pages instead of a
+     hard white-flash reload. Crucially we SCOPE it: the sidebar and header are
+     identical between pages, so fading them is just visual noise. Naming them
+     lifts them out of the transition and `animation: none` holds them static —
+     only the content area cross-fades.
 
-  Ref: https://developer.mozilla.org/en-US/docs/Web/API/View_Transition_API
+  2. Speculation Rules (prerender) — the browser prerenders likely next pages on
+     hover, so activating them is near-instant. This removes the click→paint
+     latency that a cross-fade alone can't hide.
+
+  Both are progressive enhancement: browsers without support (Firefox as of
+  2026 for both; Safari supports view transitions 18.2+) just fall back to
+  normal navigation. just-the-docs' own JS is untouched because navigation
+  stays full-page.
+
+  Refs:
+    https://developer.mozilla.org/en-US/docs/Web/API/View_Transition_API
+    https://developer.mozilla.org/en-US/docs/Web/API/Speculation_Rules_API
 {%- endcomment -%}
 <style>
   @view-transition {
     navigation: auto;
   }
 
-  /* Honour users who ask for reduced motion: skip the cross-fade animation. */
+  /* Sidebar + header are persistent chrome — don't animate them, only the
+     content. Selectors match just-the-docs' DOM (.side-bar, .main-header). */
+  .side-bar    { view-transition-name: jtd-sidebar; }
+  .main-header { view-transition-name: jtd-header; }
+
+  ::view-transition-group(jtd-sidebar),
+  ::view-transition-group(jtd-header) {
+    animation: none;
+  }
+
+  /* Keep the content cross-fade short and unobtrusive. */
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 120ms;
+  }
+
+  /* Reduced motion: no cross-fade at all — instant cut. */
   @media (prefers-reduced-motion: reduce) {
     ::view-transition-group(*),
     ::view-transition-old(*),
@@ -27,3 +52,14 @@
     }
   }
 </style>
+
+<script type="speculationrules">
+{
+  "prerender": [
+    {
+      "where": { "href_matches": "/questioner/*" },
+      "eagerness": "moderate"
+    }
+  ]
+}
+</script>
